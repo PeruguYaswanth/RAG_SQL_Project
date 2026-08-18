@@ -89,7 +89,7 @@ Edit `.env`:
 DATABASE_URL=postgresql://username:password@localhost:5432/rag_sql_db
 GROQ_API_KEY=gsk_your_actual_groq_api_key
 GROQ_MODEL=openai/gpt-oss-120b
-MAX_UPLOAD_MB=10
+MAX_UPLOAD_MB=50
 CSV_CHUNK_THRESHOLD_MB=2
 BATCH_SIZE=500
 SESSION_TTL_SECONDS=3600
