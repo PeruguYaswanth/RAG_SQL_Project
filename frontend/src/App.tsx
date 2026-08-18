@@ -4,7 +4,6 @@ import {
   Database,
   Send,
   Trash2,
-  Code2,
   ChevronDown,
   ChevronUp,
   AlertCircle,
@@ -14,8 +13,6 @@ import {
   RefreshCw,
   PlusCircle,
   X,
-  Copy,
-  Check,
   Filter,
 } from 'lucide-react';
 import {
@@ -46,8 +43,6 @@ export const App: React.FC = () => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [expandedSchemas, setExpandedSchemas] = useState<Record<string, boolean>>({});
-  const [expandedSql, setExpandedSql] = useState<Record<string, boolean>>({});
-  const [copiedSqlId, setCopiedSqlId] = useState<string | null>(null);
 
   const chatBottomRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -149,16 +144,11 @@ export const App: React.FC = () => {
             ? {
                 ...msg,
                 answer: res.answer,
-                sql_query: res.sql_query,
-                row_count: res.row_count,
-                sample_rows: res.sample_rows,
                 isLoading: false,
               }
             : msg
         )
       );
-      // Auto expand SQL preview by default
-      setExpandedSql((prev) => ({ ...prev, [messageId]: true }));
     } catch (err: any) {
       // If session expired or missing (404), reset session automatically
       if (err.status === 404) {
@@ -201,16 +191,6 @@ export const App: React.FC = () => {
 
   const toggleTableSchema = (tableName: string) => {
     setExpandedSchemas((prev) => ({ ...prev, [tableName]: !prev[tableName] }));
-  };
-
-  const toggleSql = (id: string) => {
-    setExpandedSql((prev) => ({ ...prev, [id]: !prev[id] }));
-  };
-
-  const handleCopySql = (id: string, sql: string) => {
-    navigator.clipboard.writeText(sql);
-    setCopiedSqlId(id);
-    setTimeout(() => setCopiedSqlId(null), 2000);
   };
 
   const totalRowCount = session
@@ -300,7 +280,7 @@ export const App: React.FC = () => {
             </h2>
             <p style={{ color: 'var(--text-secondary)', fontSize: '0.92rem', maxWidth: 480, margin: '0 auto' }}>
               Upload CSV or Excel spreadsheets. Each file is loaded into an isolated PostgreSQL
-              table for natural language querying, filtering, and cross-table joins.
+              table for natural language querying, filtering, and cross-table analysis.
             </p>
 
             <div
@@ -458,147 +438,58 @@ export const App: React.FC = () => {
                   <Sparkles size={36} style={{ color: 'var(--accent-primary)', marginBottom: '0.85rem' }} />
                   <h3 style={{ color: 'var(--text-primary)', fontSize: '1.2rem', marginBottom: '0.5rem' }}>
                     {session.tables.length > 1
-                      ? `${session.tables.length} tables ready for multi-table querying`
+                      ? `${session.tables.length} tables ready for querying`
                       : 'Dataset ready for questions'}
                   </h3>
                   <p style={{ fontSize: '0.9rem', maxWidth: 520, margin: '0 auto' }}>
-                    Ask any natural language question across your uploaded dataset(s). The AI will convert
-                    your prompt into a secure PostgreSQL SELECT query, execute it safely, and ground its answer.
+                    Ask any natural language question across your uploaded dataset(s). The AI will analyze
+                    the underlying data and deliver clear, direct answers.
                   </p>
                 </div>
               )}
 
-              {messages.map((msg) => {
-                const sampleRows = msg.sample_rows;
-                const hasSampleRows = Array.isArray(sampleRows) && sampleRows.length > 0;
-                const sampleCols = hasSampleRows ? Object.keys(sampleRows[0]) : [];
-
-                return (
-                  <div key={msg.id} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-                    {/* User Question */}
-                    <div className="chat-bubble user">
-                      <div className="bubble-header">
-                        <span className="bubble-scope-badge">
-                          <Filter size={11} />
-                          <span>{msg.target_table_name || 'All Session Tables'}</span>
-                        </span>
-                        <span>{msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                      </div>
-                      <p style={{ fontSize: '1.02rem', fontWeight: 500 }}>{msg.question}</p>
+              {messages.map((msg) => (
+                <div key={msg.id} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                  {/* User Question */}
+                  <div className="chat-bubble user">
+                    <div className="bubble-header">
+                      <span className="bubble-scope-badge">
+                        <Filter size={11} />
+                        <span>{msg.target_table_name || 'All Session Tables'}</span>
+                      </span>
+                      <span>{msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                     </div>
-
-                    {/* Assistant Answer / SQL Results */}
-                    <div className="chat-bubble">
-                      <div className="bubble-header">
-                        <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 600, color: 'var(--text-primary)' }}>
-                          <Database size={16} style={{ color: 'var(--accent-primary)' }} />
-                          <span>Analysis Result</span>
-                        </span>
-                        {msg.row_count !== undefined && (
-                          <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                            Matched {msg.row_count} row{msg.row_count === 1 ? '' : 's'}
-                          </span>
-                        )}
-                      </div>
-
-                      {msg.isLoading ? (
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '1.25rem 0' }}>
-                          <div className="spinner" />
-                          <span style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
-                            Generating SQL query and analyzing database records...
-                          </span>
-                        </div>
-                      ) : msg.error ? (
-                        <div className="alert-banner alert-danger">
-                          <AlertCircle size={16} />
-                          <span>{msg.error}</span>
-                        </div>
-                      ) : (
-                        <>
-                          {/* Prominent Natural Language Answer */}
-                          <div className="answer-text">{msg.answer}</div>
-
-                          {/* Collapsible SQL Query */}
-                          {msg.sql_query && (
-                            <div className="sql-section">
-                              <div className="sql-header">
-                                <div
-                                  style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flex: 1 }}
-                                  onClick={() => toggleSql(msg.id)}
-                                >
-                                  <Code2 size={14} />
-                                  <span>Generated PostgreSQL Query</span>
-                                  {expandedSql[msg.id] ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-                                </div>
-
-                                <button
-                                  className="copy-btn"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleCopySql(msg.id, msg.sql_query!);
-                                  }}
-                                  title="Copy SQL to clipboard"
-                                >
-                                  {copiedSqlId === msg.id ? (
-                                    <>
-                                      <Check size={12} color="#10b981" />
-                                      <span style={{ color: '#10b981' }}>Copied</span>
-                                    </>
-                                  ) : (
-                                    <>
-                                      <Copy size={12} />
-                                      <span>Copy</span>
-                                    </>
-                                  )}
-                                </button>
-                              </div>
-
-                              {expandedSql[msg.id] && (
-                                <pre className="sql-code">{msg.sql_query}</pre>
-                              )}
-                            </div>
-                          )}
-
-                          {/* Dynamic HTML Data Table for Sample Rows */}
-                          {hasSampleRows && (
-                            <div style={{ marginTop: '0.6rem' }}>
-                              <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '0.35rem' }}>
-                                Result Records (Showing top {sampleRows.length}):
-                              </p>
-                              <div className="table-container">
-                                <table className="data-table">
-                                  <thead>
-                                    <tr>
-                                      <th style={{ width: 40, color: 'var(--text-muted)' }}>#</th>
-                                      {sampleCols.map((colKey) => (
-                                        <th key={colKey}>{colKey}</th>
-                                      ))}
-                                    </tr>
-                                  </thead>
-                                  <tbody>
-                                    {sampleRows.map((row, rIdx) => (
-                                      <tr key={rIdx}>
-                                        <td style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>{rIdx + 1}</td>
-                                        {sampleCols.map((colKey, cIdx) => (
-                                          <td key={cIdx}>
-                                            {row[colKey] !== null && row[colKey] !== undefined
-                                              ? String(row[colKey])
-                                              : 'NULL'}
-                                          </td>
-                                        ))}
-                                      </tr>
-                                    ))}
-                                  </tbody>
-                                </table>
-                              </div>
-                            </div>
-                          )}
-                        </>
-                      )}
-                    </div>
+                    <p style={{ fontSize: '1.02rem', fontWeight: 500 }}>{msg.question}</p>
                   </div>
-                );
-              })}
+
+                  {/* Assistant Answer */}
+                  <div className="chat-bubble">
+                    <div className="bubble-header">
+                      <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 600, color: 'var(--text-primary)' }}>
+                        <Database size={16} style={{ color: 'var(--accent-primary)' }} />
+                        <span>Answer</span>
+                      </span>
+                    </div>
+
+                    {msg.isLoading ? (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '1.25rem 0' }}>
+                        <div className="spinner" />
+                        <span style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
+                          Analyzing dataset records...
+                        </span>
+                      </div>
+                    ) : msg.error ? (
+                      <div className="alert-banner alert-danger">
+                        <AlertCircle size={16} />
+                        <span>{msg.error}</span>
+                      </div>
+                    ) : (
+                      /* Prominent Plain Natural Language Answer ONLY */
+                      <div className="answer-text">{msg.answer}</div>
+                    )}
+                  </div>
+                </div>
+              ))}
               <div ref={chatBottomRef} />
             </div>
 
@@ -616,7 +507,7 @@ export const App: React.FC = () => {
                     disabled={isAsking}
                   >
                     <option value="all">
-                      ✨ All Tables ({session.tables.length}) - Auto Route & JOINs
+                      ✨ All Tables ({session.tables.length}) - Auto Route
                     </option>
                     {session.tables.map((t) => (
                       <option key={t.table_name} value={t.table_name}>

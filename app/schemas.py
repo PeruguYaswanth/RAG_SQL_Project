@@ -34,12 +34,6 @@ class AskDataRequest(BaseModel):
 
 class AskDataResponse(BaseModel):
     answer: str = Field(..., description="Natural language answer grounded in the SQL query results")
-    sql_query: str = Field(..., description="Validated PostgreSQL SELECT query executed")
-    row_count: int = Field(..., description="Number of rows returned by the SQL query")
-    sample_rows: List[Dict[str, Any]] = Field(
-        default_factory=list,
-        description="First 10 raw rows returned by the query for transparency and verification"
-    )
 
 
 class DataStatusResponse(BaseModel):

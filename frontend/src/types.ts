@@ -27,9 +27,6 @@ export interface AskDataRequest {
 
 export interface AskDataResponse {
   answer: string;
-  sql_query: string;
-  row_count: number;
-  sample_rows: Record<string, any>[];
 }
 
 export interface DataStatusResponse {
@@ -57,9 +54,6 @@ export interface ChatMessage {
   target_table?: string; // Table name targeted, or 'all'
   target_table_name?: string; // Display friendly filename
   answer?: string;
-  sql_query?: string;
-  row_count?: number;
-  sample_rows?: Record<string, any>[];
   timestamp: Date;
   isLoading?: boolean;
   error?: string;

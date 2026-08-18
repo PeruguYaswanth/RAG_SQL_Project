@@ -342,10 +342,7 @@ async def ask_data(request: AskDataRequest):
     except Exception as e:
         logger.error(f"Error during SQL generation from LLM: {e}")
         return AskDataResponse(
-            answer="I couldn't generate a valid query for that question.",
-            sql_query="",
-            row_count=0,
-            sample_rows=[]
+            answer="I couldn't generate a valid query for that question."
         )
 
     # 2. Critical Multi-Table Safety Validation
@@ -359,10 +356,7 @@ async def ask_data(request: AskDataRequest):
             f"Reason: {error_reason} | Query: {raw_sql}"
         )
         return AskDataResponse(
-            answer="I couldn't generate a valid query for that question.",
-            sql_query=raw_sql,
-            row_count=0,
-            sample_rows=[]
+            answer="I couldn't generate a valid query for that question."
         )
 
     # 3. Safe Query Execution with Timeout Protection
@@ -376,10 +370,7 @@ async def ask_data(request: AskDataRequest):
     except Exception as e:
         logger.warning(f"Database query execution error for session '{request.session_id}': {e}")
         return AskDataResponse(
-            answer="I couldn't generate a valid query for that question.",
-            sql_query=sanitized_sql,
-            row_count=0,
-            sample_rows=[]
+            answer="I couldn't generate a valid query for that question."
         )
 
     # 4. Generate Natural Language Answer Grounded in Results
@@ -395,10 +386,7 @@ async def ask_data(request: AskDataRequest):
         nl_answer = f"The query executed successfully and returned {len(rows)} record(s)."
 
     return AskDataResponse(
-        answer=nl_answer,
-        sql_query=sanitized_sql,
-        row_count=len(rows),
-        sample_rows=rows[:10]
+        answer=nl_answer
     )
 
 
