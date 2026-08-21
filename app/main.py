@@ -1,17 +1,24 @@
 """
 Main FastAPI Application module for Text-to-SQL RAG on structured data.
-Supports single and multiple uploaded tables per session.
+Supports multi-table sessions and universal data/database formats:
+SQLite (.db, .sqlite, .sqlite3), SQL scripts (.sql), Parquet (.parquet),
+JSON/JSONL (.json, .jsonl, .ndjson), TSV (.tsv, .tab, .txt), CSV (.csv), and Excel (.xlsx, .xls).
 """
 
 import io
 import os
+import json
 import uuid
+import sqlite3
+import tempfile
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
@@ -44,11 +51,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rag_sql_app")
 
-# Initialize FastAPI application
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Application lifespan context: Logs startup diagnostics, verifies DB and Groq configuration,
+    and performs graceful cleanup on shutdown.
+    """
+    logger.info("Initializing Structured Data RAG API...")
+    settings = get_settings()
+
+    # Verify PostgreSQL on startup
+    try:
+        engine = get_engine()
+        if check_db_health(engine):
+            logger.info("PostgreSQL database connection established successfully.")
+        else:
+            logger.warning("PostgreSQL database connection check failed during startup.")
+    except Exception as e:
+        logger.error(f"PostgreSQL connection error during startup: {e}")
+
+    # Verify Groq key configuration on startup
+    if settings.GROQ_API_KEY and settings.GROQ_API_KEY.strip():
+        logger.info(f"Groq API configured with model: '{settings.GROQ_MODEL}'")
+    else:
+        logger.warning("GROQ_API_KEY is not configured in .env.")
+
+    yield
+    logger.info("Structured Data RAG API is shutting down...")
+
+
+# Initialize FastAPI application with lifespan management
 app = FastAPI(
     title="Structured Data RAG API (Text-to-SQL)",
-    description="Backend API for querying tabular datasets using PostgreSQL, SQLAlchemy, and Groq LLM.",
-    version="1.1.0"
+    description="Backend API for querying structured database and tabular files using PostgreSQL, SQLAlchemy, and Groq LLM.",
+    version="1.2.0",
+    lifespan=lifespan
 )
 
 # CORS middleware configuration
@@ -70,19 +108,16 @@ app.add_middleware(
 
 # In-memory session store supporting multiple tables per session
 # Key: session_id (str)
-# Value: {
-#   "session_id": str,
-#   "tables": [
-#     {
-#       "table_name": str,
-#       "columns": List[Dict[str, str]],
-#       "row_count": int,
-#       "original_filename": str
-#     }, ...
-#   ],
-#   "uploaded_at": datetime
-# }
 sessions: Dict[str, Dict[str, Any]] = {}
+
+SUPPORTED_EXTENSIONS = [
+    ".csv", ".tsv", ".tab", ".txt",
+    ".xlsx", ".xls",
+    ".db", ".sqlite", ".sqlite3",
+    ".sql",
+    ".parquet",
+    ".json", ".jsonl", ".ndjson",
+]
 
 
 def cleanup_expired_sessions() -> None:
@@ -129,10 +164,67 @@ async def session_cleanup_middleware(request: Request, call_next):
     return response
 
 
+@app.get("/health", tags=["Health"])
+async def root_health():
+    """
+    Root health check endpoint: Verifies application runtime status,
+    Groq API key configuration, and PostgreSQL database connectivity.
+    """
+    settings = get_settings()
+    groq_configured = bool(settings.GROQ_API_KEY and settings.GROQ_API_KEY.strip())
+    database_configured = False
+
+    try:
+        engine = get_engine()
+        database_configured = check_db_health(engine)
+    except Exception as e:
+        logger.error(f"Database health check error: {e}")
+
+    overall_status = "healthy" if (groq_configured and database_configured) else "degraded"
+    status_code = status.HTTP_200_OK if overall_status == "healthy" else status.HTTP_200_OK
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": overall_status,
+            "app": "running",
+            "groq_configured": groq_configured,
+            "database_configured": database_configured
+        }
+    )
+
+
+@app.get("/health/db", tags=["Health"])
+async def db_health():
+    """
+    Dedicated database health check: Verifies PostgreSQL connectivity.
+    Returns HTTP 200 if connected, or HTTP 503 Service Unavailable if database is unreachable.
+    """
+    database_configured = False
+    error_detail = None
+    try:
+        engine = get_engine()
+        database_configured = check_db_health(engine)
+    except Exception as e:
+        error_detail = str(e)
+        logger.error(f"Database health check failed: {e}")
+
+    if database_configured:
+        return {"status": "healthy", "database": "connected"}
+    else:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "status": "unhealthy",
+                "database": "disconnected",
+                "detail": error_detail or "Failed to connect to PostgreSQL database."
+            }
+        )
+
+
 @app.get("/api/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
     """
-    Health check endpoint: Verifies application status, Groq API key configuration,
+    Frontend API health check endpoint: Verifies application status, Groq API key configuration,
     and PostgreSQL database connectivity.
     """
     settings = get_settings()
@@ -153,17 +245,203 @@ async def health_check():
     )
 
 
+def sanitize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure every column in the DataFrame contains only psycopg2-insertable scalars.
+
+    Columns whose values include Python dicts or lists (common in JSON/Parquet with
+    nested data) would cause a 'can't adapt type dict' error in psycopg2.
+    This function converts any such column to its JSON-string representation so it
+    can be stored as a PostgreSQL TEXT column without crashing.
+    """
+    for col in df.columns:
+        # Check a sample of non-null values to detect nested types
+        sample = df[col].dropna()
+        if len(sample) > 0 and isinstance(sample.iloc[0], (dict, list)):
+            df[col] = df[col].apply(
+                lambda v: json.dumps(v, ensure_ascii=False, default=str) if isinstance(v, (dict, list)) else v
+            )
+    return df
+
+
+def extract_dataframes_from_file(filename: str, content: bytes, ext: str) -> List[Tuple[str, pd.DataFrame]]:
+    """
+    Parses various database and data file formats (SQLite, SQL dumps, Parquet, JSON, TSV, CSV, Excel)
+    and returns a list of (table_label, dataframe) pairs.
+    """
+    base_name = os.path.splitext(filename)[0]
+    results: List[Tuple[str, pd.DataFrame]] = []
+
+    # 1. SQLite Database Files (.db, .sqlite, .sqlite3)
+    if ext in [".db", ".sqlite", ".sqlite3"]:
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp_file:
+            tmp_file.write(content)
+            tmp_path = tmp_file.name
+
+        try:
+            conn = sqlite3.connect(tmp_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+            sqlite_tables = [r[0] for r in cursor.fetchall()]
+            if not sqlite_tables:
+                raise HTTPException(status_code=400, detail="The uploaded SQLite database contains no user tables.")
+
+            for tbl_name in sqlite_tables:
+                df = pd.read_sql_query(f'SELECT * FROM "{tbl_name}"', conn)
+                if not df.empty and len(df) > 0:
+                    results.append((f"{base_name}_{tbl_name}", df))
+            conn.close()
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        if not results:
+            raise HTTPException(status_code=400, detail="All tables in the SQLite database are empty (0 rows).")
+        return results
+
+    # 2. SQL Dump / Script Files (.sql)
+    elif ext == ".sql":
+        sql_script = content.decode("utf-8", errors="replace")
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(sql_script)
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+            sql_tables = [r[0] for r in cursor.fetchall()]
+            if not sql_tables:
+                raise HTTPException(
+                    status_code=400,
+                    detail="The SQL script did not create any readable tables with data."
+                )
+
+            for tbl_name in sql_tables:
+                df = pd.read_sql_query(f'SELECT * FROM "{tbl_name}"', conn)
+                if not df.empty and len(df) > 0:
+                    results.append((f"{base_name}_{tbl_name}", df))
+            conn.close()
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to execute SQL dump file: {str(e)}")
+
+        if not results:
+            raise HTTPException(status_code=400, detail="No data rows found in tables created by SQL script.")
+        return results
+
+    # 3. Parquet Columnar Database Files (.parquet)
+    elif ext == ".parquet":
+        try:
+            df = pd.read_parquet(io.BytesIO(content))
+            if df.empty or len(df) == 0:
+                raise HTTPException(status_code=400, detail="Uploaded Parquet file contains 0 data rows.")
+            results.append((base_name, df))
+            return results
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to parse Parquet file: {str(e)}")
+
+    # 4. JSON / JSON Lines (.json, .jsonl, .ndjson)
+    elif ext in [".json", ".jsonl", ".ndjson"]:
+        try:
+            raw_text = content.decode("utf-8", errors="replace")
+            raw_data = json.loads(raw_text)
+
+            if ext in [".jsonl", ".ndjson"] or (isinstance(raw_data, list) and len(raw_data) > 0 and not isinstance(raw_data[0], (dict, list))):
+                # Newline-delimited: each line is a JSON record
+                df = pd.read_json(io.BytesIO(content), lines=(ext in [".jsonl", ".ndjson"]))
+            elif isinstance(raw_data, list):
+                # Standard array of record objects — normalize flattens nested keys
+                df = pd.json_normalize(raw_data)
+            elif isinstance(raw_data, dict):
+                # Find the first list value (e.g. {"results": [...], "total": 5} pattern)
+                first_list = next((v for v in raw_data.values() if isinstance(v, list)), None)
+                if first_list:
+                    df = pd.json_normalize(first_list)
+                else:
+                    # Single-record object
+                    df = pd.json_normalize([raw_data])
+            else:
+                raise ValueError("JSON must contain an array of records or an object.")
+
+            if df.empty or len(df) == 0:
+                raise HTTPException(status_code=400, detail="Uploaded JSON file contains 0 data rows.")
+            results.append((base_name, sanitize_dataframe_columns(df)))
+            return results
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to parse JSON file: {str(e)}")
+
+    # 5. TSV & Delimited Text Files (.tsv, .tab, .txt)
+    elif ext in [".tsv", ".tab", ".txt"]:
+        try:
+            try:
+                df = pd.read_csv(io.BytesIO(content), sep=None, engine="python")
+            except Exception:
+                df = pd.read_csv(io.BytesIO(content), sep="\t")
+            if df.empty or len(df) == 0:
+                raise HTTPException(status_code=400, detail="Uploaded text/TSV file contains 0 data rows.")
+            results.append((base_name, df))
+            return results
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to parse TSV/delimited file: {str(e)}")
+
+    # 6. Excel Spreadsheets (.xlsx, .xls)
+    elif ext in [".xlsx", ".xls"]:
+        try:
+            excel_sheets = pd.read_excel(io.BytesIO(content), sheet_name=None)
+            for sheet_name, sheet_df in excel_sheets.items():
+                if not sheet_df.empty and len(sheet_df) > 0:
+                    label = f"{base_name}_{sheet_name}" if len(excel_sheets) > 1 else base_name
+                    results.append((label, sheet_df))
+
+            if not results:
+                raise HTTPException(status_code=400, detail="Uploaded Excel file contains 0 data rows.")
+            return results
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to parse Excel file: {str(e)}")
+
+    # 7. Standard CSV (.csv)
+    elif ext == ".csv":
+        try:
+            df = pd.read_csv(io.BytesIO(content))
+            if df.empty or len(df) == 0:
+                raise HTTPException(status_code=400, detail="Uploaded CSV file contains 0 data rows.")
+            results.append((base_name, df))
+            return results
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to parse CSV file: {str(e)}")
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported file format '{ext}'. Supported formats include: "
+                "SQLite (.db, .sqlite, .sqlite3), SQL scripts (.sql), Parquet (.parquet), "
+                "JSON (.json, .jsonl), TSV (.tsv, .tab, .txt), CSV (.csv), and Excel (.xlsx, .xls)."
+            )
+        )
+
+
 @app.post("/api/upload-data", response_model=UploadDataResponse, tags=["Data Management"])
 async def upload_data(
-    file: UploadFile = File(..., description="CSV or Excel (.xlsx) file to upload"),
-    session_id: Optional[str] = Form(None, description="Optional existing session ID to append table to")
+    file: UploadFile = File(..., description="Database or tabular file to upload (.db, .sqlite, .sql, .parquet, .json, .csv, .xlsx, etc.)"),
+    session_id: Optional[str] = Form(None, description="Optional existing session ID to append table(s) to")
 ):
     """
-    Uploads a CSV or Excel dataset, parses it safely with bounded memory usage,
-    dynamically generates a dedicated PostgreSQL table with inferred types,
+    Uploads a dataset or database file, parses tables safely into memory,
+    dynamically creates dedicated PostgreSQL table(s) with inferred types,
     and loads the data in batches.
     
-    If called with an existing session_id, appends the newly uploaded table to the session's tables list.
+    Supports SQLite database files (.db, .sqlite), SQL dumps (.sql), Parquet (.parquet),
+    JSON/JSONL (.json, .jsonl), TSV (.tsv), CSV (.csv), and Excel (.xlsx, .xls).
     """
     cleanup_expired_sessions()
     settings = get_settings()
@@ -179,10 +457,14 @@ async def upload_data(
     # Validate file extension
     filename = file.filename or "data.csv"
     ext = os.path.splitext(filename)[1].lower()
-    if ext not in [".csv", ".xlsx", ".xls"]:
+    if ext not in SUPPORTED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file format '{ext}'. Only CSV (.csv) and Excel (.xlsx, .xls) files are supported."
+            detail=(
+                f"Unsupported file format '{ext}'. Supported formats: "
+                "SQLite (.db, .sqlite, .sqlite3), SQL (.sql), Parquet (.parquet), "
+                "JSON (.json, .jsonl), TSV (.tsv, .tab, .txt), CSV (.csv), and Excel (.xlsx, .xls)."
+            )
         )
 
     # Read and validate file content & size
@@ -196,102 +478,70 @@ async def upload_data(
             detail=f"File size ({len(content) / (1024 * 1024):.2f} MB) exceeds limit of {settings.MAX_UPLOAD_MB} MB."
         )
 
-    # Generate sanitized and isolated table name
-    sanitized_fn = sanitize_identifier(os.path.splitext(filename)[0], prefix="dataset_")
-    session_no_dashes = active_session_id.replace("-", "")
-    base_table_name = f"data_{session_no_dashes}_{sanitized_fn}"[:55]
-
-    # Guarantee table name uniqueness within session if uploading duplicate filenames
-    existing_tables = [t["table_name"] for t in sessions.get(active_session_id, {}).get("tables", [])]
-    table_name = base_table_name
-    counter = 2
-    while table_name in existing_tables:
-        table_name = f"{base_table_name}_{counter}"[:63]
-        counter += 1
+    # Extract all DataFrames from the uploaded file
+    extracted_tables = extract_dataframes_from_file(filename, content, ext)
 
     engine = get_engine()
-    chunk_threshold_bytes = settings.CSV_CHUNK_THRESHOLD_MB * 1024 * 1024
-    columns_info = []
-    total_row_count = 0
+    session_no_dashes = active_session_id.replace("-", "")
+    new_table_entries = []
 
-    try:
-        if ext == ".csv":
-            # For larger CSVs, process in chunks to keep memory usage strictly bounded
-            if len(content) > chunk_threshold_bytes:
-                csv_file_buffer = io.BytesIO(content)
-                reader = pd.read_csv(csv_file_buffer, chunksize=1000)
-                is_first_chunk = True
+    # Get existing table names in the session to avoid naming collisions
+    existing_tables = [t["table_name"] for t in sessions.get(active_session_id, {}).get("tables", [])]
 
-                for chunk_df in reader:
-                    if chunk_df.empty:
-                        continue
-                    # Sanitize column names
-                    chunk_df.columns = [sanitize_identifier(col, prefix="col_") for col in chunk_df.columns]
+    for label, df in extracted_tables:
+        # Sanitize columns and cell values
+        df = sanitize_dataframe_columns(df)
+        df.columns = [sanitize_identifier(col, prefix="col_") for col in df.columns]
 
-                    if is_first_chunk:
-                        columns_info = create_table_from_dataframe_schema(engine, table_name, chunk_df)
-                        is_first_chunk = False
+        # Generate unique isolated table name
+        sanitized_label = sanitize_identifier(label, prefix="dataset_")
+        base_table_name = f"data_{session_no_dashes}_{sanitized_label}"[:55]
 
-                    inserted = insert_dataframe_in_batches(
-                        engine, table_name, chunk_df, batch_size=settings.BATCH_SIZE
-                    )
-                    total_row_count += inserted
+        table_name = base_table_name
+        counter = 2
+        while table_name in existing_tables or any(t["table_name"] == table_name for t in new_table_entries):
+            table_name = f"{base_table_name}_{counter}"[:63]
+            counter += 1
 
-                if is_first_chunk or total_row_count == 0:
-                    raise HTTPException(status_code=400, detail="Uploaded CSV file contains 0 data rows.")
-            else:
-                # Small CSV file
-                df = pd.read_csv(io.BytesIO(content))
-                if df.empty or len(df) == 0:
-                    raise HTTPException(status_code=400, detail="Uploaded CSV file contains 0 data rows.")
-                df.columns = [sanitize_identifier(col, prefix="col_") for col in df.columns]
-                columns_info = create_table_from_dataframe_schema(engine, table_name, df)
-                total_row_count = insert_dataframe_in_batches(
-                    engine, table_name, df, batch_size=settings.BATCH_SIZE
-                )
-        else:
-            # Excel file (.xlsx, .xls)
-            df = pd.read_excel(io.BytesIO(content))
-            if df.empty or len(df) == 0:
-                raise HTTPException(status_code=400, detail="Uploaded Excel file contains 0 data rows.")
-            df.columns = [sanitize_identifier(col, prefix="col_") for col in df.columns]
+        # Create PostgreSQL table and load records in batches
+        try:
             columns_info = create_table_from_dataframe_schema(engine, table_name, df)
-            total_row_count = insert_dataframe_in_batches(
-                engine, table_name, df, batch_size=settings.BATCH_SIZE
+            total_rows = insert_dataframe_in_batches(engine, table_name, df, batch_size=settings.BATCH_SIZE)
+        except Exception as e:
+            logger.error(f"Failed to create/insert table '{table_name}' in PostgreSQL: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Database import failed: {str(e)}"
             )
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to parse or load uploaded file: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=f"Failed to parse data file: {str(e)}")
-
-    new_table_entry = {
-        "table_name": table_name,
-        "columns": columns_info,
-        "row_count": total_row_count,
-        "original_filename": filename,
-    }
+        table_entry = {
+            "table_name": table_name,
+            "columns": columns_info,
+            "row_count": total_rows,
+            "original_filename": f"{filename} ({label})" if len(extracted_tables) > 1 else filename,
+        }
+        new_table_entries.append(table_entry)
 
     # Append to existing session or initialize new multi-table session
     if active_session_id in sessions:
-        sessions[active_session_id]["tables"].append(new_table_entry)
+        sessions[active_session_id]["tables"].extend(new_table_entries)
         sessions[active_session_id]["uploaded_at"] = datetime.now(timezone.utc)
     else:
         sessions[active_session_id] = {
             "session_id": active_session_id,
-            "tables": [new_table_entry],
+            "tables": new_table_entries,
             "uploaded_at": datetime.now(timezone.utc),
         }
 
     session_tables = sessions[active_session_id]["tables"]
+    primary_new_table = new_table_entries[0]
 
     return UploadDataResponse(
         session_id=active_session_id,
         tables=[TableInfo(**t) for t in session_tables],
-        table_name=table_name,
-        columns=[ColumnInfo(**c) for c in columns_info],
-        row_count=total_row_count,
+        table_name=primary_new_table["table_name"],
+        columns=[ColumnInfo(**c) for c in primary_new_table["columns"]],
+        row_count=primary_new_table["row_count"],
     )
 
 
@@ -425,7 +675,6 @@ async def clear_data(
     cleanup_expired_sessions()
     session = sessions.get(session_id)
     if not session:
-        # If already expired or cleared, return success idempotently
         return ClearDataResponse(status="cleared")
 
     engine = get_engine()

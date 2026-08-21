@@ -15,12 +15,12 @@ logger = logging.getLogger(__name__)
 
 def get_groq_client() -> Optional[Groq]:
     """
-    Returns an initialized Groq client if GROQ_API_KEY is configured.
+    Returns an initialized Groq client with timeout protection if GROQ_API_KEY is configured.
     """
     settings = get_settings()
     if not settings.GROQ_API_KEY:
         return None
-    return Groq(api_key=settings.GROQ_API_KEY)
+    return Groq(api_key=settings.GROQ_API_KEY, timeout=30.0)
 
 
 def format_table_schema_prompt(table_info: Dict[str, Any]) -> str:
@@ -108,7 +108,7 @@ def generate_sql_query(
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.0,
-        max_tokens=350,
+        max_tokens=1000,
     )
 
     sql_output = response.choices[0].message.content.strip()

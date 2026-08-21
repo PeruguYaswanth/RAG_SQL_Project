@@ -4,10 +4,12 @@ safe identifier quoting, dynamic table generation, and batched execution.
 """
 
 import re
+import json
 import logging
 from typing import List, Dict, Any, Tuple
 from contextlib import contextmanager
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text, Engine
 from sqlalchemy.sql.elements import quoted_name
@@ -18,16 +20,22 @@ logger = logging.getLogger(__name__)
 
 # Cached SQLAlchemy engine instance
 _engine: Engine = None
+_engine_url: str = None
 
 
 def get_engine() -> Engine:
     """
     Creates or returns a singleton SQLAlchemy engine configured with connection pooling.
+    Re-creates the engine if DATABASE_URL has changed (e.g., after .env reload).
     """
-    global _engine
-    if _engine is None:
-        settings = get_settings()
-        # SQLAlchemy engine with connection pooling and pre-ping to handle stale connections
+    global _engine, _engine_url
+    settings = get_settings()
+    if _engine is None or _engine_url != settings.DATABASE_URL:
+        if _engine is not None:
+            try:
+                _engine.dispose()
+            except Exception:
+                pass
         _engine = create_engine(
             settings.DATABASE_URL,
             pool_size=10,
@@ -35,7 +43,20 @@ def get_engine() -> Engine:
             pool_pre_ping=True,
             pool_recycle=1800,
         )
+        _engine_url = settings.DATABASE_URL
     return _engine
+
+
+def reset_engine() -> None:
+    """Dispose and clear the cached engine (useful in tests or after config changes)."""
+    global _engine, _engine_url
+    if _engine is not None:
+        try:
+            _engine.dispose()
+        except Exception:
+            pass
+    _engine = None
+    _engine_url = None
 
 
 def sanitize_identifier(raw_name: str, prefix: str = "col_") -> str:
@@ -116,6 +137,45 @@ def create_table_from_dataframe_schema(
     return schema_info
 
 
+def _coerce_value(val: Any) -> Any:
+    """
+    Coerce a Python/NumPy/Pandas value into a type psycopg2 can natively adapt.
+
+    psycopg2 handles: None, bool, int, float, str, datetime, date, bytes.
+    It CANNOT handle: dict, list, numpy scalars, pandas Timestamp, numpy bool_.
+
+    Rules applied in order:
+    1. None  → pass through as SQL NULL
+    2. pandas Timestamp / datetime-like  → Python datetime
+    3. numpy integer/float/bool scalars  → Python int/float/bool via .item()
+    4. dict or list  → JSON string (TEXT column)
+    5. Any remaining non-primitive  → str()
+    """
+    if val is None:
+        return None
+
+    # pandas Timestamp, datetime.datetime, datetime.date
+    if hasattr(val, "to_pydatetime"):
+        return val.to_pydatetime()
+
+    # numpy scalars (np.int64, np.float32, np.bool_, etc.)
+    if isinstance(val, np.generic):
+        return val.item()
+
+    # Python dict or list → serialize to JSON string so it can be stored as TEXT
+    if isinstance(val, (dict, list)):
+        try:
+            return json.dumps(val, ensure_ascii=False, default=str)
+        except Exception:
+            return str(val)
+
+    # Any other exotic type → stringify
+    if not isinstance(val, (bool, int, float, str, bytes)):
+        return str(val)
+
+    return val
+
+
 def insert_dataframe_in_batches(
     engine: Engine,
     table_name: str,
@@ -154,12 +214,7 @@ def insert_dataframe_in_batches(
                 row_dict = {}
                 for col_idx, col in enumerate(columns):
                     val = row[col]
-                    # Convert pandas Timestamp or numpy types to standard Python types if needed
-                    if hasattr(val, "to_pydatetime"):
-                        val = val.to_pydatetime()
-                    elif hasattr(val, "item"):
-                        val = val.item()
-                    row_dict[f"val_{col_idx}"] = val
+                    row_dict[f"val_{col_idx}"] = _coerce_value(val)
                 batch_params.append(row_dict)
 
             conn.execute(insert_stmt, batch_params)
