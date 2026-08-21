@@ -27,6 +27,26 @@ import {
   clearData,
 } from './api';
 
+const ALLOWED_EXTENSIONS = [
+  'csv',
+  'xlsx',
+  'xls',
+  'db',
+  'sqlite',
+  'sqlite3',
+  'sql',
+  'parquet',
+  'json',
+  'jsonl',
+  'ndjson',
+  'tsv',
+  'tab',
+  'txt',
+];
+
+const ACCEPT_STRING =
+  '.csv, .xlsx, .xls, .db, .sqlite, .sqlite3, .sql, .parquet, .json, .jsonl, .ndjson, .tsv, .tab, .txt';
+
 export const App: React.FC = () => {
   // Application State
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -83,11 +103,13 @@ export const App: React.FC = () => {
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
       const file = e.dataTransfer.files[0];
       const ext = file.name.split('.').pop()?.toLowerCase();
-      if (['csv', 'xlsx', 'xls'].includes(ext || '')) {
+      if (ALLOWED_EXTENSIONS.includes(ext || '')) {
         setSelectedFile(file);
         setUploadError(null);
       } else {
-        setUploadError('Please select a CSV or Excel (.xlsx, .xls) file.');
+        setUploadError(
+          'Please select a supported database or data file (.db, .sqlite, .sql, .parquet, .json, .csv, .xlsx, .tsv).'
+        );
       }
     }
   };
@@ -198,10 +220,10 @@ export const App: React.FC = () => {
     : 0;
 
   const sampleSuggestions = [
-    'What is the total revenue?',
-    'What are the distinct categories?',
-    'Which product sold the most units?',
-    'Show the top 5 records sorted by price descending',
+    'What is the total count of records?',
+    'What are the key categories or types?',
+    'Show top records sorted by value',
+    'Summarize this dataset for me',
   ];
 
   return (
@@ -215,7 +237,7 @@ export const App: React.FC = () => {
           <div>
             <h1 className="brand-title">Text-to-SQL RAG Studio</h1>
             <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-              Structured Tabular Intelligence with PostgreSQL & Groq LLM
+              Universal Database & Data Intelligence (SQLite, SQL, Parquet, JSON, TSV, CSV, Excel)
             </p>
           </div>
         </div>
@@ -276,11 +298,10 @@ export const App: React.FC = () => {
           <div className="upload-hero-card">
             <Layers className="upload-icon" />
             <h2 style={{ fontSize: '1.6rem', fontWeight: 700, marginBottom: '0.5rem' }}>
-              Upload Tabular Datasets
+              Upload Database & Data Files
             </h2>
-            <p style={{ color: 'var(--text-secondary)', fontSize: '0.92rem', maxWidth: 480, margin: '0 auto' }}>
-              Upload CSV or Excel spreadsheets. Each file is loaded into an isolated PostgreSQL
-              table for natural language querying, filtering, and cross-table analysis.
+            <p style={{ color: 'var(--text-secondary)', fontSize: '0.92rem', maxWidth: 520, margin: '0 auto' }}>
+              Upload SQLite databases (<code>.db</code>, <code>.sqlite</code>), SQL scripts (<code>.sql</code>), Parquet (<code>.parquet</code>), JSON (<code>.json</code>, <code>.jsonl</code>), TSV, CSV, or Excel. Tables are ingested into PostgreSQL for natural language querying and joins.
             </p>
 
             <div
@@ -293,7 +314,7 @@ export const App: React.FC = () => {
                 type="file"
                 ref={fileInputRef}
                 style={{ display: 'none' }}
-                accept=".csv, .xlsx, .xls"
+                accept={ACCEPT_STRING}
                 onChange={handleFileSelect}
               />
               <FileSpreadsheet className="upload-icon" style={{ width: 42, height: 42 }} />
@@ -309,11 +330,11 @@ export const App: React.FC = () => {
               ) : (
                 <div>
                   <p style={{ fontWeight: 500, fontSize: '0.95rem' }}>
-                    Drag & drop your CSV or Excel file here, or{' '}
+                    Drag & drop your database or data file here, or{' '}
                     <span style={{ color: 'var(--accent-primary)', textDecoration: 'underline' }}>browse</span>
                   </p>
                   <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '0.5rem' }}>
-                    Supports CSV (.csv) and Excel (.xlsx, .xls) up to 10MB
+                    Supports SQLite (.db, .sqlite), SQL (.sql), Parquet (.parquet), JSON (.json, .jsonl), TSV, CSV, and Excel up to 10MB
                   </p>
                 </div>
               )}
@@ -364,7 +385,7 @@ export const App: React.FC = () => {
                       setUploadError(null);
                       setShowAddModal(true);
                     }}
-                    title="Upload another table into this session"
+                    title="Upload another database or data file into this session"
                   >
                     <PlusCircle size={15} style={{ color: '#818cf8' }} />
                     <span>Add Another File</span>
@@ -438,7 +459,7 @@ export const App: React.FC = () => {
                   <Sparkles size={36} style={{ color: 'var(--accent-primary)', marginBottom: '0.85rem' }} />
                   <h3 style={{ color: 'var(--text-primary)', fontSize: '1.2rem', marginBottom: '0.5rem' }}>
                     {session.tables.length > 1
-                      ? `${session.tables.length} tables ready for querying`
+                      ? `${session.tables.length} tables ready for querying & joins`
                       : 'Dataset ready for questions'}
                   </h3>
                   <p style={{ fontSize: '0.9rem', maxWidth: 520, margin: '0 auto' }}>
@@ -475,7 +496,7 @@ export const App: React.FC = () => {
                       <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '1.25rem 0' }}>
                         <div className="spinner" />
                         <span style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
-                          Analyzing dataset records...
+                          Analyzing database records...
                         </span>
                       </div>
                     ) : msg.error ? (
@@ -484,7 +505,7 @@ export const App: React.FC = () => {
                         <span>{msg.error}</span>
                       </div>
                     ) : (
-                      /* Prominent Plain Natural Language Answer ONLY */
+                      /* Plain Natural Language Answer */
                       <div className="answer-text">{msg.answer}</div>
                     )}
                   </div>
@@ -507,7 +528,7 @@ export const App: React.FC = () => {
                     disabled={isAsking}
                   >
                     <option value="all">
-                      ✨ All Tables ({session.tables.length}) - Auto Route
+                      ✨ All Tables ({session.tables.length}) - Auto Route & Joins
                     </option>
                     {session.tables.map((t) => (
                       <option key={t.table_name} value={t.table_name}>
@@ -546,7 +567,7 @@ export const App: React.FC = () => {
                   className="query-input"
                   placeholder={
                     selectedTable === 'all'
-                      ? "Ask a question across all session tables (e.g. 'What is total revenue by category?')"
+                      ? "Ask a question across all session tables (e.g. 'What is the top product by sales?')"
                       : `Ask a question about ${
                           session.tables.find((t) => t.table_name === selectedTable)?.original_filename || 'selected table'
                         }...`
@@ -583,7 +604,7 @@ export const App: React.FC = () => {
             <div className="modal-header">
               <h3 style={{ fontSize: '1.2rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                 <PlusCircle size={20} style={{ color: 'var(--accent-primary)' }} />
-                <span>Add Table to Active Session</span>
+                <span>Add Database or Data File to Session</span>
               </h3>
               <button
                 className="btn-secondary"
@@ -595,8 +616,7 @@ export const App: React.FC = () => {
             </div>
 
             <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
-              Upload another CSV or Excel file to session <code>{session.session_id.slice(0, 8)}...</code>.
-              You will be able to query both tables individually or join them in a single query.
+              Upload another SQLite database (<code>.db</code>), SQL script (<code>.sql</code>), Parquet (<code>.parquet</code>), JSON (<code>.json</code>), TSV, CSV, or Excel file to session <code>{session.session_id.slice(0, 8)}...</code>.
             </p>
 
             <div
@@ -610,7 +630,7 @@ export const App: React.FC = () => {
                 type="file"
                 ref={modalFileInputRef}
                 style={{ display: 'none' }}
-                accept=".csv, .xlsx, .xls"
+                accept={ACCEPT_STRING}
                 onChange={handleFileSelect}
               />
               <FileSpreadsheet className="upload-icon" style={{ width: 36, height: 36 }} />
@@ -626,10 +646,10 @@ export const App: React.FC = () => {
               ) : (
                 <div>
                   <p style={{ fontWeight: 500, fontSize: '0.9rem' }}>
-                    Select or drag & drop another CSV / Excel file
+                    Select or drag & drop another database or tabular file
                   </p>
                   <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
-                    Supports .csv, .xlsx, .xls (up to 10MB)
+                    Supports .db, .sqlite, .sql, .parquet, .json, .tsv, .csv, .xlsx (up to 10MB)
                   </p>
                 </div>
               )}
@@ -658,12 +678,12 @@ export const App: React.FC = () => {
                 {isUploading ? (
                   <>
                     <div className="spinner" />
-                    <span>Uploading Table...</span>
+                    <span>Uploading File...</span>
                   </>
                 ) : (
                   <>
                     <Upload size={16} />
-                    <span>Upload & Add Table</span>
+                    <span>Upload & Add File</span>
                   </>
                 )}
               </button>
